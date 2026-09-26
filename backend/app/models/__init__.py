@@ -1,0 +1,1 @@
+# Reserved for future ORM models. Intentionally empty — no DB in v1.
