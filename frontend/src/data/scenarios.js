@@ -1,6 +1,5 @@
 export const EXAMPLE_SCENARIOS = [
   "My exam is tomorrow and I haven't studied.",
-  "I accidentally texted my boss what I meant for my girlfriend.",
   "I have ₹500 left and payday is 20 days away.",
   "My interview starts in 2 hours and I just learned Python.",
   "I haven't started my final year project and it's due Friday.",
