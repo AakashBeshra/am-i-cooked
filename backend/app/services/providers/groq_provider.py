@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Dict
 
 import httpx
@@ -23,6 +24,7 @@ import httpx
 from .base import AIProvider, ProviderError
 
 logger = logging.getLogger("am_i_cooked.groq")
+
 
 NARRATIVE_SYSTEM = """You are the analyst voice of "AM I COOKED?" — a witty \
 but caring app that scores how badly someone has messed up a situation.
@@ -46,7 +48,12 @@ RULES:
 - Funny commentary: one punchline. Internet tone. Not mean.
 - What happens next: 3-5 fictional predictions with "when" and "what".
 - Be honest. Do not inflate humor to hide useful advice.
-- Return ONLY valid JSON matching the schema. No prose, no markdown.
+
+OUTPUT FORMAT:
+- Respond with ONLY a raw JSON object. No markdown fences. No reasoning \
+tags. No thinking blocks. No preamble. No trailing commentary.
+- Start your response with the character { and end with the character }.
+- If you catch yourself writing anything before {, delete it and start over.
 """
 
 
@@ -88,8 +95,7 @@ class GroqProvider(AIProvider):
     async def analyze(self, situation: str, category: str) -> Dict[str, Any]:
         # Groq no longer analyzes full situations — the AIService handles
         # parsing and scoring. This method exists only to satisfy the ABC,
-        # and is never called by AIService. If it ever is, it defers to
-        # the narrative-only path in `narrate`.
+        # and is never called by AIService.
         raise ProviderError(
             "GroqProvider.analyze is not used. Call .narrate() with a Scene."
         )
@@ -120,9 +126,12 @@ class GroqProvider(AIProvider):
                 {"role": "system", "content": NARRATIVE_SYSTEM},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": 0.7,
-            "response_format": {"type": "json_object"},
-            "max_tokens": 900,
+            "temperature": 0.6,
+            "max_tokens": 1200,
+            # NOTE: We intentionally do NOT set response_format=json_object.
+            # gpt-oss-* models on Groq reject that mode with HTTP 400
+            # (json_validate_failed / empty generation). Instead we rely on
+            # the system prompt to enforce JSON and strip any fences here.
         }
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -137,18 +146,32 @@ class GroqProvider(AIProvider):
             )
             r.raise_for_status()
             data = r.json()
-            raw = data["choices"][0]["message"]["content"]
+            raw = data["choices"][0]["message"]["content"] or ""
         except httpx.HTTPStatusError as e:
-            raise ProviderError(
-                f"Groq HTTP {e.response.status_code}: {e.response.text[:200]}"
-            ) from e
+            # Extract just the message from Groq's error JSON when possible
+            detail = e.response.text[:300]
+            try:
+                err = e.response.json()
+                detail = err.get("error", {}).get("message", detail)
+            except Exception:
+                pass
+            raise ProviderError(f"Groq HTTP {e.response.status_code}: {detail}") from e
         except (httpx.HTTPError, KeyError, IndexError) as e:
             raise ProviderError(f"Groq transport error: {e}") from e
 
+        cleaned = self._extract_json(raw)
+        if not cleaned:
+            raise ProviderError(
+                f"Groq returned no JSON. Raw length={len(raw)}. "
+                f"First 200 chars: {raw[:200]!r}"
+            )
+
         try:
-            parsed = json.loads(raw)
+            parsed = json.loads(cleaned)
         except json.JSONDecodeError as e:
-            raise ProviderError(f"Groq returned invalid JSON: {e}") from e
+            raise ProviderError(
+                f"Groq returned invalid JSON: {e}. Raw: {cleaned[:200]!r}"
+            ) from e
 
         return self._normalize(parsed)
 
@@ -193,8 +216,8 @@ Respond with a single JSON object matching this shape EXACTLY:
 {schema_example}
 
 Constraints:
-- reasons: 3-5 items, each emoji is a single emoji, label is ≤ 12 words.
-- risk_factors: 3-4 items, plain text, ≤ 10 words each.
+- reasons: 3-5 items, each emoji is a single emoji, label is <= 12 words.
+- risk_factors: 3-4 items, plain text, <= 10 words each.
 - recovery_plan: 4-6 items, concrete and situation-aware.
 - emergency_actions: 4-5 items IF score >= 70, else empty array [].
 - funny_commentary: one punchline, internet voice, not mean.
@@ -203,8 +226,69 @@ Constraints:
 Respond with ONLY the JSON object. No markdown, no code fences, no commentary."""
 
     # ------------------------------------------------------------------
-    # Response normalization
+    # Response parsing
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_json(text: str) -> str:
+        """
+        Robustly extract a JSON object from a model response.
+
+        Handles:
+        - Plain JSON:  {"score": 96, ...}
+        - Fenced:      ```json\\n{...}\\n```
+        - Preamble:    "Here is the JSON: {...}"
+        - Reasoning:   "<thinking>...</thinking>\\n{...}"  (gpt-oss style)
+        - Trailing:    "{...}\\n\\nHope this helps!"
+        """
+        if not text:
+            return ""
+
+        s = text.strip()
+
+        # Strip reasoning tags common in gpt-oss output
+        s = re.sub(r"<\|.*?\|>", "", s, flags=re.DOTALL)
+        s = re.sub(r"</?think(ing)?>", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"</?reasoning>", "", s, flags=re.IGNORECASE)
+
+        # Strip markdown code fences
+        if s.startswith("```"):
+            s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+            s = re.sub(r"\s*```\s*$", "", s)
+
+        s = s.strip()
+
+        # If it starts with "{", find the matching closing brace.
+        if s.startswith("{"):
+            depth = 0
+            in_string = False
+            escape = False
+            for i, ch in enumerate(s):
+                if escape:
+                    escape = False
+                    continue
+                if ch == "\\":
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return s[: i + 1]
+
+        # Fallback: find the first { ... } block anywhere
+        start = s.find("{")
+        end = s.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return s[start : end + 1]
+
+        return ""
 
     @staticmethod
     def _normalize(raw: Dict[str, Any]) -> Dict[str, Any]:

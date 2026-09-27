@@ -25,9 +25,17 @@ router = APIRouter(prefix="/api", tags=["cooked"])
 async def health() -> HealthResponse:
     settings = get_settings()
     service = get_ai_service()
+
+    # New AIService shape: `groq` is an optional GroqProvider, None if unused.
+    # We surface a provider label for the frontend based on what's active.
+    if service.groq is not None:
+        provider_name = "groq"
+    else:
+        provider_name = "rules"
+
     return HealthResponse(
         status="ok",
-        provider=service.primary.name,
+        provider=provider_name,
         provider_configured=settings.provider_is_configured(),
         version="1.0.0",
     )
