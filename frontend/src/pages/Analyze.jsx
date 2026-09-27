@@ -77,7 +77,7 @@ export default function Analyze() {
       const result = await analyzeSituation({ situation: trimmed, category });
 
       // Local fallback if backend totally failed AND fallback also failed
-            const safe = result && typeof result.score === "number"
+      const safe = result && typeof result.score === "number"
         ? result
         : fallbackAnalysis(trimmed, category);
 
@@ -215,8 +215,7 @@ export default function Analyze() {
           </div>
         </form>
 
-        {/* Quiz stub — Phase 4 */}
-                {/* Quiz entry point */}
+        {/* Quiz entry point */}
         <div className="mt-10 rounded-2xl glass p-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2 text-white/80">
