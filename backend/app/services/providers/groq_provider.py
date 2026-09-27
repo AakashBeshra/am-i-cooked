@@ -14,6 +14,7 @@ keeps the Cooked Score deterministic and prevents token-burn on scoring.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -109,7 +110,16 @@ class GroqProvider(AIProvider):
         category: str,
     ) -> Dict[str, Any]:
         """Produce the narrative fields only. Returns a dict matching
-        the shape of narrative.rules_narrate() minus score/severity/category."""
+        the shape of narrative.rules_narrate() minus score/severity/category.
+
+        Retries on:
+          - 429 rate limit (waits 2s, then 4s)
+          - 5xx server errors (waits 1.5s)
+          - Empty or unparseable JSON responses (waits 1s)
+
+        Gives up after 3 attempts and raises ProviderError so the caller
+        can fall back to the rules narrative.
+        """
         client = await self._client_instance()
 
         user_prompt = self._build_user_prompt(
@@ -138,42 +148,103 @@ class GroqProvider(AIProvider):
             "Content-Type": "application/json",
         }
 
-        try:
-            r = await client.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-            )
-            r.raise_for_status()
-            data = r.json()
-            raw = data["choices"][0]["message"]["content"] or ""
-        except httpx.HTTPStatusError as e:
-            # Extract just the message from Groq's error JSON when possible
-            detail = e.response.text[:300]
+        max_attempts = 3
+        last_error: str = "unknown"
+
+        for attempt in range(max_attempts):
             try:
-                err = e.response.json()
-                detail = err.get("error", {}).get("message", detail)
-            except Exception:
-                pass
-            raise ProviderError(f"Groq HTTP {e.response.status_code}: {detail}") from e
-        except (httpx.HTTPError, KeyError, IndexError) as e:
-            raise ProviderError(f"Groq transport error: {e}") from e
+                r = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
 
-        cleaned = self._extract_json(raw)
-        if not cleaned:
-            raise ProviderError(
-                f"Groq returned no JSON. Raw length={len(raw)}. "
-                f"First 200 chars: {raw[:200]!r}"
-            )
+                # --- 429 rate limit → wait and retry ---
+                if r.status_code == 429:
+                    wait_s = 2.0 + attempt * 2.0  # 2s, 4s, 6s
+                    logger.info(
+                        "Groq 429 rate-limited, waiting %.1fs (attempt %d/%d)",
+                        wait_s, attempt + 1, max_attempts,
+                    )
+                    last_error = "429 rate limited"
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(wait_s)
+                        continue
+                    break
 
-        try:
-            parsed = json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            raise ProviderError(
-                f"Groq returned invalid JSON: {e}. Raw: {cleaned[:200]!r}"
-            ) from e
+                # --- Any other 4xx/5xx → let httpx raise ---
+                r.raise_for_status()
 
-        return self._normalize(parsed)
+                data = r.json()
+                raw = data["choices"][0]["message"]["content"] or ""
+                cleaned = self._extract_json(raw)
+
+                # --- Empty or unparseable response → retry ---
+                if not cleaned:
+                    logger.info(
+                        "Groq empty/unparseable response (attempt %d/%d), retrying",
+                        attempt + 1, max_attempts,
+                    )
+                    last_error = f"no JSON (raw length {len(raw)})"
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(1.0)
+                        continue
+                    break
+
+                # --- Try parsing ---
+                try:
+                    parsed = json.loads(cleaned)
+                except json.JSONDecodeError as e:
+                    logger.info(
+                        "Groq invalid JSON (attempt %d/%d): %s",
+                        attempt + 1, max_attempts, e,
+                    )
+                    last_error = f"invalid JSON: {e}"
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(1.0)
+                        continue
+                    break
+
+                # --- Success ---
+                logger.info(
+                    "Groq narrative succeeded on attempt %d/%d",
+                    attempt + 1, max_attempts,
+                )
+                return self._normalize(parsed)
+
+            except httpx.HTTPStatusError as e:
+                # 4xx/5xx from Groq
+                detail = e.response.text[:200]
+                try:
+                    err = e.response.json()
+                    detail = err.get("error", {}).get("message", detail)
+                except Exception:
+                    pass
+                last_error = f"HTTP {e.response.status_code}: {detail}"
+                logger.info(
+                    "Groq HTTP %d (attempt %d/%d): %s",
+                    e.response.status_code, attempt + 1, max_attempts, detail,
+                )
+                # Retry on 5xx (transient), don't retry on 4xx (permanent)
+                if 500 <= e.response.status_code < 600 and attempt < max_attempts - 1:
+                    await asyncio.sleep(1.5)
+                    continue
+                break
+
+            except (httpx.HTTPError, KeyError, IndexError) as e:
+                last_error = f"transport/parse: {e}"
+                logger.info(
+                    "Groq transport error (attempt %d/%d): %s",
+                    attempt + 1, max_attempts, e,
+                )
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(1.5)
+                    continue
+                break
+
+        raise ProviderError(
+            f"Groq failed after {max_attempts} attempts: {last_error}"
+        )
 
     async def what_next(self, situation: str, score: int) -> Dict[str, Any]:
         # Handled inside narrate(). Not called separately.
